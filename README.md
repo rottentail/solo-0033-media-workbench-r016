@@ -561,16 +561,34 @@ One to eight occurrences and at most thirty output seconds are supported.
 `/audition` POST routes accept a new `destination`, optional `at_sample` and
 `samples` on the 48 kHz output clock, and `block_frames` from 1 to 65536.
 They deliver stereo float WAV, preserving source trims, occurrence gain and
-joint-channel phase relationships. Timing maps do not change pitch: waveform
-alignment preserves voiced periodicity while protected attack neighbourhoods
-avoid duplicating short onsets. This is a bounded waveform overlap processor,
-not a speech model or a claim to transparent processing of arbitrary music.
+joint-channel phase relationships. Timing maps do not change pitch: a
+streaming WSOLA engine walks a fixed synthesis hop while a source-continuity
+search keeps consecutive grains phase aligned, so voiced periodicity (and
+thus vowel pitch) follows the source rather than the timing speed. The
+analysis displacement is computed once on the joint mono signal and applied
+identically to both channels, preserving the original inter-channel phase and
+left/right balance without per-channel processing. Grains containing a
+detected attack are displacement-locked, so a short onset is rendered once and
+stays crisp rather than being duplicated or smeared while joins are smoothed.
+This is a bounded waveform overlap processor, not a speech model or a claim to
+transparent processing of arbitrary music.
 
-Synthesis follows the saved picture clock, retaining internal source/picture
-anchors. An audition is cropped from that complete synthesis history, so it
-matches complete delivery regardless of block size or later timeline edits.
-Decoded originals are materialized once per occurrence to temporary disk;
-only local analysis windows and output blocks remain in memory. Sources are
-checked before decoding and before publication. Relocated verified originals
-remain usable, occupied destinations remain protected and failures remove
-private temporary files. Ordinary retiming keeps its pitch-changing contract.
+Every saved source/picture point is retained in the frozen plan and becomes a
+locked grain whose analysis centre is placed exactly on the contracted source
+position, so each marked word or phrase reaches its contracted picture
+instant; search displacement accumulated inside a span resets at the next
+anchor rather than drifting through it. An identity (1:1) map is an exact
+sample passthrough. Synthesis follows the saved picture clock from a
+deterministic per-occurrence grain schedule, so it is independent of block
+size. Each render or audition first synthesizes the complete programme
+history into a private temporary file and then crops the requested window, so
+an audition reproduces the complete delivery at the same positions even after
+reopening the project or changing the block size, and later timeline edits
+cannot alter a frozen plan. Decoded originals are materialized and read once
+per occurrence, strictly forward through small rolling rings; the full
+programme is never resident in memory, keeping the 30-second, eight-occurrence
+programme within the delivery memory budget. Sources are checked before
+decoding and before publication. Relocated verified originals remain usable,
+occupied destinations remain protected and failures remove private temporary
+files. Ordinary retiming keeps its pitch-changing contract. Old version-one
+plans remain readable and rebuild their schedule on load.

@@ -1,26 +1,16 @@
-"""Freeze source-to-picture dialogue timing independently of later edits."""
+"""Freeze source-to-picture dialogue timing independently of later edits.
+
+Every recorder-marked source/picture knot is retained, not reduced to a single
+average ratio, so mid-occurrence anchors reach their contracted picture
+instants. A deterministic synthesis schedule is attached at creation time;
+older version-one payloads (endpoints only) are still readable and rebuilt on
+the fly, keeping previously saved databases usable.
+"""
 import hashlib
 import json
-import math
-from . import db, timeline
+from . import db, timeline, stretch_signal
 
 RATE = 48000
-
-
-def compile_clock(knots):
-    source, output = knots[-1]
-    ratio = source/output
-    clock = []
-    for origin in range(0, output, 1024):
-        count = min(1024, output-origin)
-        left = min(source, math.floor(origin*ratio))
-        right = min(source, math.ceil((origin+count)*ratio))
-        clock.append(dict(origin=origin, frames=count, source=left,
-                          source_end=right, speed=ratio))
-    first, last = knots[0], knots[-1]
-    compact = [[first[0], first[1]], [last[0], last[1]]]
-    return dict(knots=compact, clock=clock,
-                input_points=len(knots), speed=ratio)
 
 
 def create(conn, project_id, maps):
@@ -43,15 +33,20 @@ def create(conn, project_id, maps):
         if knots[0] != [0, 0] or knots[-1][0] != source:
             raise ValueError('timing map must cover the complete trimmed source')
         for (a, b), (c, d) in zip(knots, knots[1:]):
+            if c <= a or d <= b:
+                raise ValueError('timing positions must strictly increase')
             if c-a < 3840 or d-b < 3840 or not .5 <= (c-a)/(d-b) <= 2:
                 raise ValueError('timing spans need 80 ms and speed between one half and two')
-        compiled = compile_clock(knots)
+        schedule = stretch_signal.build_schedule(
+            [(float(a), float(b)) for a, b in knots])
+        output_samples = knots[-1][1]
         saved.append(dict(clip=clip, source_samples=source,
-                          output_samples=knots[-1][1], offset=total, **compiled))
-        total += knots[-1][1]
+                          output_samples=output_samples, offset=total,
+                          knots=knots, schedule=schedule))
+        total += output_samples
     if total > RATE * 30:
         raise ValueError('dialogue programme exceeds thirty seconds')
-    payload = dict(version=1, snapshot=snapshot, occurrences=saved, samples=total)
+    payload = dict(version=2, snapshot=snapshot, occurrences=saved, samples=total)
     encoded = json.dumps(payload, sort_keys=True, separators=(',', ':'), allow_nan=False)
     with db.write(conn):
         row = conn.execute('INSERT INTO stretch_plans(payload,payload_sha256) VALUES (?,?)',
@@ -64,6 +59,12 @@ def get(conn, identity):
     if row is None or hashlib.sha256(row['payload'].encode()).hexdigest() != row['payload_sha256']:
         raise ValueError('dialogue timing plan missing or damaged')
     payload = json.loads(row['payload'])
-    if payload['version'] != 1:
+    if payload.get('version') not in (1, 2):
         raise ValueError('unsupported dialogue timing plan')
+    if payload['version'] == 1:
+        # Legacy payloads only stored endpoints; rebuild their linear schedule.
+        for occurrence in payload['occurrences']:
+            occurrence.setdefault(
+                'schedule', stretch_signal.build_schedule(
+                    [(float(a), float(b)) for a, b in occurrence['knots']]))
     return dict(payload, id=identity)

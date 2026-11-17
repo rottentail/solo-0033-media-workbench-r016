@@ -1,4 +1,12 @@
-"""Render frozen dialogue timing with one decode and deterministic auditions."""
+"""Render frozen dialogue timing with one decode and deterministic auditions.
+
+Every render or audition first synthesizes the complete frozen programme
+history into a private temporary file, then crops the requested window from
+it. An audition therefore reproduces the complete delivery at the same
+positions, regardless of block size, and later timeline edits cannot change a
+frozen plan. Each trimmed occurrence is materialized and read exactly once,
+strictly forward; only local windows and output blocks stay resident.
+"""
 import json
 import os
 from pathlib import Path
@@ -6,38 +14,6 @@ import tempfile
 from . import stretch_plan, stretch_signal, media_sources, audio_signal
 from .assets import fingerprint
 from .tools import run
-
-
-class StemRange:
-    def __init__(self, handle, first, frames):
-        self.handle = handle
-        self.first = first
-        self.frames = frames
-        self.position = 0
-
-    def seek(self, offset):
-        self.position = max(0, min(self.frames*8, offset))
-        self.handle.seek(self.first*8+self.position)
-
-    def read(self, count):
-        count = max(0, min(count, self.frames*8-self.position))
-        data = self.handle.read(count)
-        self.position += len(data)
-        return data
-
-
-def audition_occurrence(occurrence, left, right):
-    begin = left-occurrence['offset']
-    end = right-occurrence['offset']
-    ratio = occurrence['source_samples']/occurrence['output_samples']
-    first = int(begin*ratio)
-    last = min(occurrence['source_samples'], int(end*ratio+.999999))
-    frames = max(1, last-first)
-    local = dict(occurrence, source_samples=frames, output_samples=right-left,
-                 knots=[[0, 0], [frames, right-left]], offset=left,
-                 speed=frames/(right-left))
-    local.pop('clock', None)
-    return first, local
 
 
 def render(conn, identity, destination, at_sample=0, samples=None, block_frames=4096):
@@ -54,32 +30,36 @@ def render(conn, identity, destination, at_sample=0, samples=None, block_frames=
         raise ValueError('dialogue destination exists or directory missing')
     with tempfile.TemporaryDirectory(prefix='.stretch-', dir=target.parent) as directory:
         root = Path(directory)
-        raw, output = root/'dialogue.f32', root/'dialogue.wav'
+        programme = root/'programme.f32'
+        excerpt = root/'excerpt.f32'
+        output = root/'dialogue.wav'
         selected = []
-        with raw.open('wb') as handle:
+        # Full-history synthesis: one forward pass per occurrence, in order.
+        with programme.open('wb') as handle:
             for occurrence in plan['occurrences']:
                 clip = media_sources.select(conn, occurrence['clip'])
                 clip['has_audio'] = any(s.get('codec_type') == 'audio'
                                         for s in json.loads(clip['metadata'])['streams'])
                 selected.append(clip)
-                left = max(at_sample, occurrence['offset'])
-                right = min(at_sample+samples, occurrence['offset']+occurrence['output_samples'])
-                if left >= right:
-                    continue
-                first, local = audition_occurrence(occurrence, left, right)
-                cursor = left
                 with audio_signal.materialized(clip) as source, source.open('rb') as stem:
-                    bounded = StemRange(stem, first, local['source_samples'])
-                    for pcm in stretch_signal.blocks(bounded, local, block_frames):
-                        end = cursor+len(pcm)
-                        left, right = max(cursor, at_sample), min(end, at_sample+samples)
-                        if left < right:
-                            handle.write(pcm[left-cursor:right-cursor].astype('<f4').tobytes())
-                        cursor = end
-        if raw.stat().st_size != samples*8:
+                    local = dict(occurrence, clip=clip)
+                    for pcm in stretch_signal.synthesize(stem, local, block_frames):
+                        handle.write(pcm.astype('<f4').tobytes())
+        if programme.stat().st_size != plan['samples']*8:
             raise ValueError('incomplete dialogue output')
+        # Crop the requested audition window from the deterministic history.
+        with programme.open('rb') as history, excerpt.open('wb') as cropped:
+            history.seek(at_sample*8)
+            remaining = samples*8
+            while remaining:
+                chunk = history.read(min(remaining, 1 << 16))
+                if not chunk:
+                    raise ValueError('incomplete dialogue audition')
+                cropped.write(chunk)
+                remaining -= len(chunk)
         run('ffmpeg', ['-v', 'error', '-y', '-f', 'f32le', '-ar', '48000', '-ac', '2',
-                       '-i', str(raw), '-c:a', 'pcm_f32le', str(output)])
+                       '-i', str(excerpt), '-c:a', 'pcm_f32le', str(output)])
+        # Re-verify immutable source identity before publication.
         for clip in selected:
             media_sources.select(conn, clip)
         checksum = fingerprint(output)
